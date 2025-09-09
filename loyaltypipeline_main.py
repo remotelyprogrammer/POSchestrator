@@ -1,6 +1,6 @@
 import os
 import shutil # Import shutil for moving files
-from LoyaltyPipeline import PipelineRunner
+from LoyaltyPipeline2 import PipelineRunner
 import glob # Import glob for pattern matching file names
 
 # Define directories

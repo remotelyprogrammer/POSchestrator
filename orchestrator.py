@@ -10,7 +10,7 @@ import os
 import glob
 import logging
 from typing import List, Dict, Optional, Tuple
-from LoyaltyPipeline import PipelineRunner
+from LoyaltyPipeline2 import PipelineRunner
 from settings import POS_SHOPS, BASE_POS_DATA_DIR, REQUIRED_SUBDIRS
 
 # Configure logging
@@ -71,34 +71,53 @@ class POSDataOrchestrator:
                 os.makedirs(dir_path, exist_ok=True)
                 logger.info(f"Created directory: {dir_path}")
     
-    def _find_transtable_files(self, brand: str, shop: str) -> List[str]:
+    def _find_monthly_transtable_file(self, brand: str, shop: str, month: str, year: str) -> Optional[str]:
         """
-        Find all Excel files in the transtable directory for a given shop.
-        
-        Args:
-            brand: Brand name
-            shop: Shop name
-            
-        Returns:
-            List of full paths to Excel files
+        Find the Excel file for the given brand/shop/month/year in the transtable directory.
+        Accepts both full month name (e.g., 'September') and two-digit month (e.g., '09').
+        Returns the first match or None if not found.
         """
+        import re
+        from calendar import month_name
         transtable_path = os.path.join(self._get_shop_path(brand, shop), "transtable")
-        
         if not os.path.exists(transtable_path):
             logger.warning(f"Transtable directory not found: {transtable_path}")
-            return []
-        
-        # Look for Excel files (.xlsx, .xls)
-        excel_patterns = [
-            os.path.join(transtable_path, "*.xlsx"),
-            os.path.join(transtable_path, "*.xls")
-        ]
-        
-        excel_files = []
-        for pattern in excel_patterns:
-            excel_files.extend(glob.glob(pattern))
-        
-        return excel_files
+            return None
+        # Normalize month
+        month_str = str(month).strip()
+        year_str = str(year).strip()
+        # Accept both 'September' and '09'
+        try:
+            if month_str.isdigit():
+                month_num = int(month_str)
+                month_full = month_name[month_num]
+                month_variants = [f"{month_num:02d}", month_full]
+            else:
+                # Try to get month number from name
+                month_full = month_str.capitalize()
+                month_num = [i for i, m in enumerate(month_name) if m.lower() == month_full.lower()]
+                if month_num:
+                    month_num = month_num[0]
+                    month_variants = [f"{month_num:02d}", month_full]
+                else:
+                    month_variants = [month_full]
+        except Exception:
+            month_variants = [month_str]
+        # Build regex pattern for file name
+        # Example: Manam Cebu September 2025.xlsx or Manam Cebu 09 2025.xlsx
+        safe_brand = re.escape(brand)
+        safe_shop = re.escape(shop)
+        safe_year = re.escape(year_str)
+        candidates = []
+        for m in month_variants:
+            pattern = re.compile(rf"^{safe_brand}\s+{safe_shop}\s+{m}\s+{safe_year}\.xlsx$", re.IGNORECASE)
+            for fname in os.listdir(transtable_path):
+                if pattern.match(fname):
+                    candidates.append(os.path.join(transtable_path, fname))
+        if candidates:
+            return candidates[0]
+        logger.warning(f"No monthly file found for {brand} - {shop} [{month_str} {year_str}] in {transtable_path}")
+        return None
     
     def _get_output_directory(self, brand: str, shop: str) -> str:
         """
@@ -113,7 +132,7 @@ class POSDataOrchestrator:
         """
         return self._get_shop_path(brand, shop)
     
-    def _process_shop_file(self, brand: str, shop: str, excel_file_path: str, pipeline_types: List[str] = None) -> Dict[str, str]:
+    def _process_shop_file(self, brand: str, shop: str, excel_file_path: str, pipeline_types: List[str] = None, month: str = None, year: str = None) -> Dict[str, str]:
         """
         Process a single Excel file for a shop using the LoyaltyPipeline.
         
@@ -128,161 +147,161 @@ class POSDataOrchestrator:
         """
         file_name = os.path.basename(excel_file_path)
         logger.info(f"Processing '{file_name}' for {brand} - {shop}")
-        
         # Default to both pipelines if not specified
         if pipeline_types is None:
             pipeline_types = ['sls', 'sdet']
-        
         # Validate pipeline types
         valid_types = ['sls', 'sdet']
         pipeline_types = [pt.lower() for pt in pipeline_types]
         for pt in pipeline_types:
             if pt not in valid_types:
                 raise ValueError(f"Invalid pipeline type '{pt}'. Must be one of: {valid_types}")
-        
         logger.info(f"Running pipelines: {', '.join(pipeline_types).upper()}")
-        
         try:
-            # Get the shop directory as output directory
             output_directory = self._get_output_directory(brand, shop)
-            
-            # Create PipelineRunner instance
             pipeline_orchestrator = PipelineRunner.from_config(
                 excel_file_path=excel_file_path,
                 config_file_path=self.config_file_path,
                 branch_mapping_file_path=self.branch_mapping_file_path,
                 output_directory=output_directory
             )
-            
-            # Read sheets once for efficiency
             all_sheets_dict = pipeline_orchestrator.data_reader.read_sheets()
-            
-            # Execute selected pipelines
             output_files = {}
-            
+            # Output file naming convention: SDET_MMYY_Brand_Shop.csv, SLS_MMYY_Brand_Shop.csv
+            from datetime import datetime
+            # Determine MM and YY
+            if month and year:
+                try:
+                    if month.isdigit():
+                        mm = f"{int(month):02d}"
+                    else:
+                        dt = datetime.strptime(month[:3], "%b")
+                        mm = f"{dt.month:02d}"
+                except Exception:
+                    mm = month[:2]
+                yy = year[-2:]
+            else:
+                now = datetime.now()
+                mm = now.strftime('%m')
+                yy = now.strftime('%y')
+            brand_safe = brand.replace(' ', '_').upper()
+            shop_safe = shop.replace(' ', '_').upper()
             if 'sls' in pipeline_types:
                 sls_output = pipeline_orchestrator.run_sls_pipeline(all_sheets_dict)
-                output_files['sls_file'] = sls_output
-            
+                # Rename/move output file to new convention
+                sls_new_name = f"SLS_{mm}{yy}_{brand_safe}_{shop_safe}.csv"
+                sls_new_path = os.path.join(output_directory, sls_new_name)
+                if sls_output != sls_new_path:
+                    try:
+                        os.replace(sls_output, sls_new_path)
+                        logger.info(f"Renamed SLS output to: {sls_new_path}")
+                    except Exception as e:
+                        logger.warning(f"Could not rename SLS output: {e}")
+                output_files['sls_file'] = sls_new_path
             if 'sdet' in pipeline_types:
                 sdet_output = pipeline_orchestrator.run_sdet_pipeline(all_sheets_dict)
-                output_files['sdet_file'] = sdet_output
-            
+                sdet_new_name = f"SDET_{mm}{yy}_{brand_safe}_{shop_safe}.csv"
+                sdet_new_path = os.path.join(output_directory, sdet_new_name)
+                if sdet_output != sdet_new_path:
+                    try:
+                        os.replace(sdet_output, sdet_new_path)
+                        logger.info(f"Renamed SDET output to: {sdet_new_path}")
+                    except Exception as e:
+                        logger.warning(f"Could not rename SDET output: {e}")
+                output_files['sdet_file'] = sdet_new_path
             logger.info(f"✅ Successfully processed '{file_name}' for {brand} - {shop}")
             if 'sls_file' in output_files:
                 logger.info(f"   SLS Output: {output_files['sls_file']}")
             if 'sdet_file' in output_files:
                 logger.info(f"   SDET Output: {output_files['sdet_file']}")
-            
             return output_files
-            
         except Exception as e:
             logger.error(f"❌ Failed to process '{file_name}' for {brand} - {shop}: {e}")
             raise
     
-    def process_shop(self, brand: str, shop: str, pipeline_types: List[str] = None) -> List[Dict[str, str]]:
+    def process_shop(self, brand: str, shop: str, pipeline_types: List[str] = None, month: str = None, year: str = None) -> List[Dict[str, str]]:
         """
-        Process all Excel files for a specific brand and shop.
-        
+        Process the monthly Excel file for a specific brand and shop.
         Args:
             brand: Brand name
             shop: Shop name
             pipeline_types: List of pipeline types to run ('sls', 'sdet'). If None, runs both.
-            
+            month: Month to process (e.g., 'September' or '09')
+            year: Year to process (e.g., '2025')
         Returns:
-            List of dictionaries containing output file paths for each processed file
+            List of dictionaries containing output file paths for the processed file (empty if not found)
         """
-        logger.info(f"\n=== Processing {brand} - {shop} ===")
-        
+        logger.info(f"\n=== Processing {brand} - {shop} ({month} {year}) ===")
         # Validate brand exists in configuration
         brand_config = next((b for b in POS_SHOPS if b["brand"] == brand), None)
         if not brand_config:
             raise ValueError(f"Brand '{brand}' not found in configuration")
-        
         # Validate shop exists in brand configuration
         if shop not in brand_config["shops"]:
             raise ValueError(f"Shop '{shop}' not found in brand '{brand}' configuration")
-        
         # Ensure shop directories exist
         self._ensure_shop_directories(brand, shop)
-        
-        # Find Excel files to process
-        excel_files = self._find_transtable_files(brand, shop)
-        
-        if not excel_files:
-            logger.warning(f"No Excel files found in transtable directory for {brand} - {shop}")
+        # Find the monthly Excel file to process
+        excel_file = self._find_monthly_transtable_file(brand, shop, month, year)
+        if not excel_file:
+            logger.warning(f"No Excel file found for {brand} - {shop} [{month} {year}] in transtable directory.")
             return []
-        
-        logger.info(f"Found {len(excel_files)} Excel file(s) to process for {brand} - {shop}")
-        
-        # Process each file
+        logger.info(f"Found monthly Excel file to process for {brand} - {shop}: {os.path.basename(excel_file)}")
         results = []
-        for excel_file in excel_files:
-            try:
-                output_files = self._process_shop_file(brand, shop, excel_file, pipeline_types)
-                results.append(output_files)
-            except Exception as e:
-                logger.error(f"Error processing file {excel_file}: {e}")
-                # Continue with next file instead of stopping completely
-                continue
-        
+        try:
+            output_files = self._process_shop_file(brand, shop, excel_file, pipeline_types, month=month, year=year)
+            results.append(output_files)
+        except Exception as e:
+            logger.error(f"Error processing file {excel_file}: {e}")
         return results
     
-    def process_brand(self, brand: str, pipeline_types: List[str] = None) -> Dict[str, List[Dict[str, str]]]:
+    def process_brand(self, brand: str, pipeline_types: List[str] = None, month: str = None, year: str = None) -> Dict[str, List[Dict[str, str]]]:
         """
-        Process all shops for a specific brand.
-        
+        Process all shops for a specific brand for a given month/year.
         Args:
             brand: Brand name
             pipeline_types: List of pipeline types to run ('sls', 'sdet'). If None, runs both.
-            
+            month: Month to process
+            year: Year to process
         Returns:
             Dictionary mapping shop names to their processing results
         """
-        logger.info(f"\n🏢 Processing Brand: {brand}")
-        
-        # Validate brand exists in configuration
+        logger.info(f"\n🏢 Processing Brand: {brand} ({month} {year})")
         brand_config = next((b for b in POS_SHOPS if b["brand"] == brand), None)
         if not brand_config:
             raise ValueError(f"Brand '{brand}' not found in configuration")
-        
         results = {}
         for shop in brand_config["shops"]:
             try:
-                shop_results = self.process_shop(brand, shop, pipeline_types)
+                shop_results = self.process_shop(brand, shop, pipeline_types, month=month, year=year)
                 results[shop] = shop_results
             except Exception as e:
                 logger.error(f"Error processing shop {shop}: {e}")
                 results[shop] = []
-                # Continue with next shop instead of stopping completely
                 continue
-        
         return results
     
-    def process_all(self, pipeline_types: List[str] = None) -> Dict[str, Dict[str, List[Dict[str, str]]]]:
+    def process_all(self, pipeline_types: List[str] = None, month: str = None, year: str = None) -> Dict[str, Dict[str, List[Dict[str, str]]]]:
         """
-        Process all brands and shops configured in settings.
-        
+        Process all brands and shops for a given month/year.
         Args:
             pipeline_types: List of pipeline types to run ('sls', 'sdet'). If None, runs both.
-        
+            month: Month to process
+            year: Year to process
         Returns:
             Dictionary mapping brand names to shop results
         """
-        logger.info("\n🚀 Starting Full Processing Run - All Brands and Shops")
-        
+        logger.info(f"\n🚀 Starting Full Processing Run - All Brands and Shops ({month} {year})")
         results = {}
         for brand_config in POS_SHOPS:
             brand = brand_config["brand"]
             try:
-                brand_results = self.process_brand(brand, pipeline_types)
+                brand_results = self.process_brand(brand, pipeline_types, month=month, year=year)
                 results[brand] = brand_results
             except Exception as e:
                 logger.error(f"Error processing brand {brand}: {e}")
                 results[brand] = {}
-                # Continue with next brand instead of stopping completely
                 continue
-        
         return results
     
     def get_available_brands(self) -> List[str]:

@@ -168,19 +168,28 @@ python3 main.py --brand Manam --shop Cebu --verbose
 - **Output**: `SDET_MMDDYY_BRAND_BRANCH_SHOP.csv`
 - **Use Case**: Inventory analysis, product performance, detailed item tracking
 
-### Output File Naming Convention
-Files are automatically named using the format:
-```
-{PIPELINE}_{DATE}_{BRAND}_{BRAND}_{SHOP}.csv
-```
-- `PIPELINE`: SLS or SDET
-- `DATE`: MMDDYY from the source Excel filename
-- `BRAND`: Brand name in uppercase
-- `SHOP`: Shop name in uppercase
+
+### Monthly File Logic & Output File Naming Convention
+
+**How the app selects the file to process:**
+- For each shop, the app looks for a single Excel file in the `transtable` folder matching the pattern:
+   - `{Brand} {Shop} {MonthName} {Year}.xlsx` (e.g., `Manam Cebu September 2025.xlsx`)
+   - or `{Brand} {Shop} {MM} {Year}.xlsx` (e.g., `Manam Cebu 09 2025.xlsx`)
+- The app does **not** use the file's date modified. It selects the file by matching the filename for the selected (or current) month and year.
+- If no file is found for the month/year, a warning is logged and no output is generated for that shop.
+
+**Output file naming:**
+- Output files are named:
+   - `SLS_MMYY_BRAND_SHOP.csv` (e.g., `SLS_0925_MANAM_CEBU.csv`)
+   - `SDET_MMYY_BRAND_SHOP.csv` (e.g., `SDET_0925_MANAM_CEBU.csv`)
+- Where:
+   - `MM` = two-digit month (e.g., `09` for September)
+   - `YY` = last two digits of year (e.g., `25` for 2025)
+   - `BRAND` and `SHOP` are uppercase with spaces replaced by underscores
 
 **Examples:**
-- `SLS_081725_MANAM_MANAM_GREENHILLS.csv`
-- `SDET_070925_MANAM_MANAM_SM_CEBU.csv`
+- `SLS_0925_MANAM_CEBU.csv`
+- `SDET_0925_MANAM_CEBU.csv`
 
 ---
 
@@ -283,12 +292,16 @@ POSchestrator/
             └── SDET_*.csv      # Generated SDET files
 ```
 
+
 ### Input Requirements
 - Excel files must be placed in `POS DATA/{Brand}/{Shop}/transtable/`
+- Each shop should have **one file per month** (the file can be overwritten daily as needed)
 - Files must contain the required sheets:
-  - For SLS: Transaction Header, Trans. Sales Entry, Trans. Payment Entry, Trans. Infocode Entry
-  - For SDET: Trans. Sales Entry
-- Files should follow naming convention: `{Brand} {Shop} {DateRange}.xlsx`
+   - For SLS: Transaction Header, Trans. Sales Entry, Trans. Payment Entry, Trans. Infocode Entry
+   - For SDET: Trans. Sales Entry
+- Files **must** follow the naming convention for monthly selection:
+   - `{Brand} {Shop} {MonthName} {Year}.xlsx` (e.g., `Manam Cebu September 2025.xlsx`)
+   - or `{Brand} {Shop} {MM} {Year}.xlsx` (e.g., `Manam Cebu 09 2025.xlsx`)
 
 ### Output Locations
 Generated CSV files are placed in the respective brand/shop directories:
