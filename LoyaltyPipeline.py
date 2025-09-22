@@ -6,6 +6,7 @@ import json
 import logging
 from typing import Dict, Any
 
+from pathlib import Path
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -103,14 +104,11 @@ class BaseDataFrameTransformer:
                 logger.warning(f"Default column '{default_col}' not found in target_df schema.")
         return target_df
 
-    def transform(self, data_sheets: dict[str, pd.DataFrame]) -> pd.DataFrame:
-        """Transforms the given data sheets into a DataFrame."""
-        raise NotImplementedError("Subclasses must implement the 'transform' method.")
-
 class SlsDataFrameTransformer(BaseDataFrameTransformer):
     """Transforms data for the Sales Header (SLS) table."""
-    def __init__(self, branch_mapping_df: pd.DataFrame, sls_columns: list[str], column_mapping: dict[str, str]):
+    def __init__(self, branch_mapping_df: pd.DataFrame, sls_columns: list[str], column_mapping: dict[str, str], infocodes_for_note: list[str]):
         super().__init__(branch_mapping_df, sls_columns, column_mapping)
+        self.infocodes_for_note = infocodes_for_note
 
     def _set_default_mapping(self, trans_header: pd.DataFrame):
         super()._set_default_mapping(trans_header)
@@ -194,13 +192,14 @@ class SlsDataFrameTransformer(BaseDataFrameTransformer):
             logger.info("SLS: Processing infocode entry data...")
             tie_sls = trans_infocode_entry[
                 (trans_infocode_entry['Transaction No.'].isin(sls_df['Transaction No.'])) &
-                (trans_infocode_entry['Infocode'] == "1MOMENT")
+                (trans_infocode_entry['Infocode'].isin(self.infocodes_for_note))
             ].copy()
             if 'Information' not in tie_sls.columns:
                 tie_sls['Information'] = ''
             else:
-                tie_sls['Information'] = tie_sls['Information'].astype(str)
+                tie_sls['Information'] = pd.to_numeric(tie_sls['Information'], errors='coerce')
             tie_sls = tie_sls[['Transaction No.','Information']]
+            tie_sls = tie_sls.dropna(subset=['Information'])
 
             logger.info("SLS: Merging dataframes...")
             merged_df = pd.merge(sls_df, tse_sls_for_merge, on='Transaction No.', how='left')
@@ -275,19 +274,22 @@ class SdetDataFrameTransformer(BaseDataFrameTransformer):
             # Add missing required columns with NaN and coerce to numeric where applicable
             for col in required_cols:
                 if col not in sdet_df.columns:
-                    sdet_df[col] = np.nan
+                    sdet_df[col] = pd.NA
 
             numeric_cols = ['Quantity', 'Price', 'Net Price', 'Cost Amount', 'VAT Amount', 'Discount Amount']
             for col in numeric_cols:
-                sdet_df[col] = pd.to_numeric(sdet_df[col], errors='coerce')
-
+                sdet_df[col] = pd.to_numeric(sdet_df[col], errors='coerce').fillna(0)
             sdet_df['Quantity'] = sdet_df['Quantity'].abs()
             sdet_df['Cost Amount'] = sdet_df['Cost Amount'].abs()
 
             # Convert all columns to string *before* applying defaults to ensure consistency
-            # Specific types will be set by DataTypeConverter later.
+            # Convert to object type for flexible initial merging, handling NaN properly
             for col in sdet_df.columns:
-                 sdet_df[col] = sdet_df[col].astype(str)
+                # For string/text columns, replace NaN with empty string before converting to string
+                if col in ['Discount Module Name', 'Staff ID']:
+                    sdet_df[col] = sdet_df[col].fillna('').astype(str)
+                else:
+                    sdet_df[col] = sdet_df[col].astype(str)
 
             logger.info("SDET: Applying column mapping and defaults...")
             sdet_table = pd.DataFrame(index=sdet_df.index, columns=self.target_columns)
@@ -328,18 +330,18 @@ class DataTypeConverter:
                         df_copy[col] = df_copy[col].dt.strftime("%Y-%m-%d").replace({pd.NA: ""})
                 elif target_dtype == 'int64':
                     df_copy[col] = pd.to_numeric(df_copy[col], errors='coerce').fillna(0).astype('int64')
-                elif target_dtype == 'float64':
-                    df_copy[col] = pd.to_numeric(df_copy[col], errors='coerce').fillna(0.0).astype('float64')
+                elif target_dtype == 'float64' and col != 'note':
+                    df_copy[col] = pd.to_numeric(df_copy[col], errors='coerce').fillna(0.0)
                 elif target_dtype == 'bool':
                     true_values = [True, 1, 'True', 'true', 'TRUE', 'Y', 'y', 'Yes', 'yes']
-                    false_values = [False, 0, 'False', 'false', 'FALSE', 'N', 'n', 'No', 'no', '', 'None', np.nan] # Added np.nan
+                    false_values = [False, 0, 'False', 'false', 'FALSE', 'N', 'n', 'No', 'no', '', 'None', pd.NA] # Added np.nan
                     # Convert to string for consistent comparison, then map
                     df_copy[col] = df_copy[col].apply(lambda x: str(x) if pd.notna(x) else '').astype(str).apply(
                         lambda x: True if x in [str(v) for v in true_values] else (False if x in [str(v) for v in false_values] else pd.NA)
                     )
                     df_copy[col] = df_copy[col].fillna(False).astype('boolean')
                 elif target_dtype == 'object':
-                    df_copy[col] = df_copy[col].astype(str).fillna('') # Fill NaN with empty string for object type
+                    df_copy[col] = df_copy[col].astype(str).replace('<NA>', "").fillna('') # Fill NaN with empty string for object type
             except Exception as e:
                 logger.error(f"Error converting column '{col}' to '{target_dtype}': {e}", exc_info=True)
                 # Optionally, re-raise or set to a default/object type if conversion fails critically
@@ -358,9 +360,13 @@ class DataSaver:
             logger.error(f"Failed to create or access output directory: {self.output_dir}")
             raise IOError(f"Output directory not accessible: {self.output_dir}")
 
-    def save(self, df: pd.DataFrame, filename_prefix: str) -> str:
+    def save(self, df: pd.DataFrame, filename_prefix: str, output_directory: str = None) -> str:
         """Saves the DataFrame to a CSV file with a dynamic filename."""
         try:
+            # Use the provided output_directory if available, otherwise use the instance's default
+            current_output_dir = output_directory if output_directory else self.output_dir
+            os.makedirs(current_output_dir, exist_ok=True)
+
             date_col = None
             if 'bill_date' in df.columns:
                 date_col = 'bill_date'
@@ -401,7 +407,7 @@ class DataSaver:
             else:
                 logger.warning("Branch column not found or is entirely null. Using 'UNKNOWN_BRANCH'.")
 
-            output_filename = os.path.join(self.output_dir, f"{filename_prefix}_{last_date_str}_{brand}_{branch}.csv")
+            output_filename = os.path.join(current_output_dir, f"{filename_prefix}_{last_date_str}_{brand}_{branch}.csv")
             logger.info(f"Saving processed data to: {output_filename}")
             df.to_csv(output_filename, index=False)
             logger.info(f"CSV file '{output_filename}' generated successfully.")
@@ -426,7 +432,7 @@ class PipelineRunner:
         self.sdet_type_converter = sdet_type_converter
         self.data_saver = data_saver
 
-    def run_sls_pipeline(self, all_sheets_dict: dict[str, pd.DataFrame]) -> str:
+    def run_sls_pipeline(self, all_sheets_dict: dict[str, pd.DataFrame], output_directory: str = None) -> str:
         """Executes the SLS data pipeline."""
         logger.info("--- SLS Data Pipeline Started ---")
         try:
@@ -434,18 +440,24 @@ class PipelineRunner:
             logger.debug(f"\nSLS DataFrame after transformation (first 5 rows):\n{processed_df.head().to_string()}")
             logger.debug(f"\nSLS DataFrame after transformation (info):\n{processed_df.info()}")
 
+            # Determine the specific output directory for this run
+            brand = processed_df['brand'].dropna().astype(str).unique()[0] if 'brand' in processed_df.columns and not processed_df['brand'].isnull().all() else None
+            branch = processed_df['branch'].dropna().astype(str).unique()[0] if 'branch' in processed_df.columns and not processed_df['branch'].isnull().all() else None
+            if output_directory and brand and branch:
+                output_directory = Path(output_directory) / brand / branch / "SLS"
+
             final_df = self.sls_type_converter.convert_types(processed_df)
             logger.debug(f"\nSLS DataFrame after type conversion (first 5 rows):\n{final_df.head().to_string()}")
             logger.debug(f"\nSLS DataFrame after type conversion (info):\n{final_df.info()}")
 
-            output_file_path = self.data_saver.save(final_df, filename_prefix="SLS")
+            output_file_path = self.data_saver.save(final_df, filename_prefix="SLS", output_directory=str(output_directory) if output_directory else None)
             logger.info("--- SLS Data Pipeline Finished ---")
             return output_file_path
         except Exception as e:
             logger.error(f"SLS Data Pipeline failed: {e}", exc_info=True)
             raise
 
-    def run_sdet_pipeline(self, all_sheets_dict: dict[str, pd.DataFrame]) -> str:
+    def run_sdet_pipeline(self, all_sheets_dict: dict[str, pd.DataFrame], output_directory: str = None) -> str:
         """Executes the SDET data pipeline."""
         logger.info("--- SDET Data Pipeline Started ---")
         try:
@@ -453,25 +465,31 @@ class PipelineRunner:
             logger.debug(f"\nSDET DataFrame after transformation (first 5 rows):\n{processed_df.head().to_string()}")
             logger.debug(f"\nSDET DataFrame after transformation (info):\n{processed_df.info()}")
 
+            # Determine the specific output directory for this run
+            brand = processed_df['brand'].dropna().astype(str).unique()[0] if 'brand' in processed_df.columns and not processed_df['brand'].isnull().all() else None
+            branch = processed_df['branch'].dropna().astype(str).unique()[0] if 'branch' in processed_df.columns and not processed_df['branch'].isnull().all() else None
+            if output_directory and brand and branch:
+                output_directory = Path(output_directory) / brand / branch / "SDET"
+
             final_df = self.sdet_type_converter.convert_types(processed_df)
             logger.debug(f"\nSDET DataFrame after type conversion (first 5 rows):\n{final_df.head().to_string()}")
             logger.debug(f"\nSDET DataFrame after type conversion (info):\n{final_df.info()}")
 
-            output_file_path = self.data_saver.save(final_df, filename_prefix="SDET")
+            output_file_path = self.data_saver.save(final_df, filename_prefix="SDET", output_directory=str(output_directory) if output_directory else None)
             logger.info("--- SDET Data Pipeline Finished ---")
             return output_file_path
         except Exception as e:
             logger.error(f"SDET Data Pipeline failed: {e}", exc_info=True)
             raise
 
-    def run_all_pipelines(self) -> dict[str, str]:
+    def run_all_pipelines(self, output_directory: str = None) -> dict[str, str]:
         """Runs all defined pipelines."""
         logger.info("--- Starting All Data Pipelines ---")
         try:
             all_sheets_dict = self.data_reader.read_sheets()
 
-            sls_output = self.run_sls_pipeline(all_sheets_dict)
-            sdet_output = self.run_sdet_pipeline(all_sheets_dict)
+            sls_output = self.run_sls_pipeline(all_sheets_dict, output_directory=output_directory)
+            sdet_output = self.run_sdet_pipeline(all_sheets_dict, output_directory=output_directory)
 
             logger.info("--- All Data Pipelines Finished ---")
             return {"sls_file": sls_output, "sdet_file": sdet_output}
@@ -513,11 +531,11 @@ class PipelineRunner:
 
     @classmethod
     def from_config(cls,
-                    excel_file_path: str, # Added to allow dynamic Excel file input
+                    excel_file_path: str,
                     config_file_path: str = "config/config.json",
                     branch_mapping_file_path: str = "config/branch_mapping.xlsx",
                     output_directory: str = "output",
-                    excel_header_row: int = 2): # Added for dynamic header row
+                    excel_header_row: int = 2):
         """Factory method to create a PipelineRunner instance from configurations."""
         logger.info(f"Initializing PipelineRunner from config for Excel file: {excel_file_path}")
         # Initialize with placeholder data_reader, it will be properly set in .execute()
@@ -530,8 +548,11 @@ class PipelineRunner:
             data_saver=DataSaver(output_dir=output_directory)
         )
 
-        config = runner_instance._load_config(config_file_path)
-        branch_mapping_df = runner_instance._load_branch_mapping(branch_mapping_file_path)
+        try:
+            config = runner_instance._load_config(config_file_path)
+            branch_mapping_df = runner_instance._load_branch_mapping(branch_mapping_file_path)
+        except FileNotFoundError:
+            raise
 
         sls_config = config.get("sls", {})
         sdet_config = config.get("sdet", {})
@@ -539,12 +560,14 @@ class PipelineRunner:
         sls_target_columns = sls_config.get("target_columns")
         sls_column_mapping = sls_config.get("column_mapping")
         sls_sql_to_pandas_dtype_map = sls_config.get("dtype_map")
+        sls_infocodes = sls_config.get("infocodes_for_note")
 
         sdet_target_columns = sdet_config.get("target_columns")
         sdet_column_mapping = sdet_config.get("column_mapping")
         sdet_sql_to_pandas_dtype_map = sdet_config.get("dtype_map")
 
         if not all([sls_target_columns, sls_column_mapping, sls_sql_to_pandas_dtype_map,
+                    sls_infocodes,
                     sdet_target_columns, sdet_column_mapping, sdet_sql_to_pandas_dtype_map]):
             logger.critical("Missing essential configuration parameters for SLS or SDET pipelines in config.json")
             raise ValueError("Missing essential configuration parameters for SLS or SDET pipelines in config.json")
@@ -552,7 +575,8 @@ class PipelineRunner:
         runner_instance.sls_transformer = SlsDataFrameTransformer(
             branch_mapping_df=branch_mapping_df.copy(), # Pass a copy to transformers to avoid unintended modifications
             sls_columns=sls_target_columns,
-            column_mapping=sls_column_mapping
+            column_mapping=sls_column_mapping,
+            infocodes_for_note=sls_infocodes
         )
         runner_instance.sdet_transformer = SdetDataFrameTransformer(
             branch_mapping_df=branch_mapping_df.copy(), # Pass a copy
@@ -568,18 +592,15 @@ class PipelineRunner:
         logger.info("PipelineRunner components instantiated successfully.")
         return runner_instance
 
-    def execute(self) -> Dict[str, str]:
+    def execute(self, output_directory: str = None) -> Dict[str, str]:
         """Executes all data processing pipelines."""
-        logger.info("Starting pipeline execution with loaded configurations.")
+        logger.info("Starting pipeline execution.")
         try:
-            # The data_reader is already initialized in from_config
-            all_sheets_dict = self.data_reader.read_sheets()
-
-            sls_output = self.run_sls_pipeline(all_sheets_dict)
-            sdet_output = self.run_sdet_pipeline(all_sheets_dict)
-
+            # The data_reader is initialized in from_config, so we can use it directly.
+            # run_all_pipelines will call the reader.
+            output_files = self.run_all_pipelines(output_directory=output_directory)
             logger.info("All pipelines executed successfully.")
-            return {"sls_file": sls_output, "sdet_file": sdet_output}
+            return output_files
 
         except FileNotFoundError as e:
             logger.error(f"Execution Error: {e}")
